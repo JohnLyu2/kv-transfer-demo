@@ -21,23 +21,40 @@ destination readiness, and storage reusability are separate facts**.
 This is an educational verification artifact inspired by TPU Sync. It does not
 prove the production implementation correct or reproduce TPU performance.
 
-## Relationship to this repository
+## Relationship to TPU Sync
+
+The optional source reference is `third_party/tpu-sync`, pinned to upstream main
+commit `6852486862ad644c2e9febb26d0f5e75be13c981` (reviewed 2026-09-09).
+See [the implementation mapping](docs/tpu-sync-mapping.md) for the reviewed
+correspondence and its limits. The demo and formal checks must run without
+initializing or building this submodule.
 
 The demo models one staged prefill-to-decode transfer route. It abstracts hardware
 and networking while preserving the dependencies that make the route difficult.
 
+The CPU demo and formal checks must not import TPU Sync's code or install its
+dependencies. See the [production mapping and submodule workflow](docs/tpu-sync-mapping.md)
+for planned correspondence, deliberate abstractions, and revision maintenance.
+The source links below require initializing the optional submodule.
+
 | TPU Sync concept | Demo representation | Code reference |
 | --- | --- | --- |
-| Producer and consumer workers | Separate Python objects and arrays | [Example serving topology](../examples/single_host_disagg/README.md) |
-| Host staging and device destination | Separate finite memory pools | [Receive state](../tpu_sync/core/kv_cache_manager_with_transfer.h) |
-| Separate network and H2D completion | Separate scheduled transfer stages | [Receive state](../tpu_sync/core/kv_cache_manager_with_transfer.h) |
-| Pins and release after use | Explicit reservations for outstanding accesses | [Cache-store contract](../tpu_sync/kv_cache/kv_cache_store.h) |
-| Request/plan generations | Transfer identity and slot allocation generation | [Request registry](../tpu_sync/kv_cache/reshard/request_block_registry.h) |
-| Publication after successful load | Destination readiness transition | [Cache-store completion handling](../tpu_sync/kv_cache/kv_cache_store.cc) |
+| Producer and consumer workers | Separate Python objects and arrays | [Example serving topology](third_party/tpu-sync/examples/single_host_disagg/README.md) |
+| Host staging and device destination | Separate finite memory pools | [Receive state](third_party/tpu-sync/tpu_sync/core/kv_cache_manager_with_transfer.h) |
+| Separate network and H2D completion | Separate scheduled transfer stages | [Receive state](third_party/tpu-sync/tpu_sync/core/kv_cache_manager_with_transfer.h) |
+| Pins and release after use | Explicit reservations for outstanding accesses | [Cache-store contract](third_party/tpu-sync/tpu_sync/kv_cache/kv_cache_store.h) |
+| Request/plan generations | Transfer identity and slot allocation generation | [Request registry](third_party/tpu-sync/tpu_sync/kv_cache/reshard/request_block_registry.h), [plan generations](third_party/tpu-sync/tpu_sync/core/kv_cache_manager_with_transfer.h) |
+| Publication after successful load | Destination readiness transition | [Backend completion callbacks](third_party/tpu-sync/tpu_sync/kv_cache/host_offload_backend.cc) |
+| Recorded operation outcomes | Client polling separate from physical completion | [BlockTracker](third_party/tpu-sync/tpu_sync/kv_cache/block_tracker.cc) |
 
 Reservations in the demo are an abstract protocol mechanism. They must not be
 equated with PJRT usage holds, raw-buffer references, or cache pins individually.
 The real system distributes those responsibilities across several layers.
+
+In this revision, backend callbacks perform load/save completion bookkeeping and
+`KVCacheStore` delegates status polling to `BlockTracker`. Remote reads use the
+regular load path. The demo should represent that separation without reproducing
+the production class hierarchy or adding more features.
 
 ## Scope
 
@@ -117,7 +134,8 @@ pending while another request advances. Use explicit events rather than sleeps:
 - start and advance staging-to-destination transfer;
 - record physical transfer completion;
 - deliver a completion notification;
-- publish a ready destination block;
+- publish a ready destination block and record its operation outcome;
+- poll recorded outcomes without advancing physical transfers;
 - consume ready data;
 - cancel a request;
 - release reservations and reuse slots.
@@ -125,7 +143,10 @@ pending while another request advances. Use explicit events rather than sleeps:
 Physical completion and notification delivery are distinct so a notification may
 arrive after cancellation or slot reuse. A slot may only be reused when no old
 operation can access it. Generation checks reject stale bookkeeping updates;
-they do not prevent an already-issued physical write.
+they do not prevent an already-issued physical write. Completion can occur
+without a client poll. Polling observes accumulated outcomes; it must not be what
+makes a copy finish or makes its destination physically valid. A completion record
+is not itself a reservation keeping memory alive.
 
 For simplicity, cancellation does not abort a submitted copy. Submitted work
 drains to physical completion, its unwanted result is not published, and its
@@ -146,7 +167,7 @@ context to be ready. Do not claim an atomic update of an entire multi-block cach
 
 Track request interest, transfer stage/progress, cache-block identity, slot
 allocation generation, source/destination reservations, delivered completion
-notifications, and destination readiness separately.
+notifications, recorded client-visible outcomes, and destination readiness separately.
 
 The model's initial finite configuration should use two cache identities, two
 requests, two pieces per block, and at most two concurrent transfers. Use one
@@ -164,6 +185,7 @@ the executable workload can use larger tensors than the checker.
 | S4 | A slot cannot be reassigned while an outstanding operation may access it. |
 | S5 | A completion notification cannot publish or release a different transfer or allocation generation. |
 | S6 | Cancellation does not grant permission to reuse storage still in use, and prevents subsequent publication for that cancelled operation. |
+| S7 | Polling observes recorded outcomes without advancing a physical transfer or bypassing readiness and lifetime rules. |
 
 Assume each modeled piece copy faithfully transfers its source value, memory
 regions are disjoint as declared, and consumers follow the readiness interface.
@@ -226,28 +248,34 @@ tested executions. They are not a proof of complete implementation refinement.
 ## Proposed files
 
 ```text
-verification/
+kv-transfer-demo/
+  README.md
   PLAN.md
-  kv_transfer_demo/
-    README.md
-    requirements.txt
-    model.py                # Tiny attention model and recomputation reference
-    protocol.py             # Pools, reservations, operations, scheduler
+  pyproject.toml
+  src/kv_transfer_demo/
+    attention.py            # Tiny model and recomputation reference
+    protocol.py             # Pools, reservations, operations, outcomes
+    scheduler.py            # Deterministic event scheduling
     demo.py                 # CLI scenarios and trace replay
-    tests/                  # Numerical and protocol regression checks
-    formal/
-      KVTransfer.tla
-      small.cfg
-      context.cfg
-      assumptions.md
-    traces/                 # Small checked-in counterexample/replay examples
-    tooling/
-      check_model.sh        # Pinned TLC runner with explicit failure handling
-      export_trace.py       # Converts checker output to replay format
+  tests/                    # Numerical and protocol regression checks
+  formal/
+    KVTransfer.tla
+    small.cfg
+    context.cfg
+    assumptions.md
+  traces/                   # Small counterexample/replay examples
+  tooling/
+    check_model.sh          # Pinned TLC runner with explicit failure handling
+    export_trace.py         # Converts checker output to replay format
+  docs/
+    tpu-sync-mapping.md      # Reviewed source mapping and abstractions
+  third_party/
+    tpu-sync/               # Optional, pinned source-reference submodule
 ```
 
 Use NumPy plus a lightweight Python test runner for the workload, and Java/TLC
-for verification. Pin tool versions when implementation begins. Keep generated
+for verification. Pin Python and TLC tool versions when implementation begins. The TPU Sync
+reference is already pinned separately; changing it requires a mapping review. Keep generated
 checker state, downloaded tools, and bulky logs out of Git. Start with a terminal
 trace/table; a visual trace viewer is optional after the full workflow works.
 
