@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools==80.9.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kv-transfer-demo"
+version = "0.1.0"
+description = "CPU-only numerical baseline for staged KV-cache transfers"
+requires-python = ">=3.11"
+dependencies = ["numpy==2.2.6"]
+
+[tool.setuptools.packages.find]
+where = ["src"]

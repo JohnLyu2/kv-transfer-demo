@@ -84,12 +84,13 @@ the production class hierarchy or adding more features.
 ### Tiny attention model
 
 Start with a vocabulary of 16 token IDs, embedding dimension 8, one attention
-head, and one causal attention layer. Use fixed positional embeddings and seeded
+head, and one causal attention layer. Use sinusoidal positional embeddings and seeded
 weights. Prompts should contain about six tokens, with a block size of two tokens.
 Generate two additional tokens per successful request using deterministic argmax.
 
-This is an untrained attention model with an output projection, not a production
-LLM. Its role is to provide a real computation that depends on correct KV data.
+This attention model uses fixed synthetic weights and an output projection.
+Its role is to provide a real computation that depends on correct KV data;
+generated token IDs are not intended to represent meaningful text.
 
 Implement two paths:
 
@@ -274,14 +275,17 @@ kv-transfer-demo/
 ```
 
 Use NumPy plus a lightweight Python test runner for the workload, and Java/TLC
-for verification. Pin Python and TLC tool versions when implementation begins. The TPU Sync
-reference is already pinned separately; changing it requires a mapping review. Keep generated
+for verification. The baseline pins Python in `.python-version` and NumPy in
+`pyproject.toml`; pin TLC when formal implementation begins. The TPU Sync
+reference is pinned separately; changing it requires a mapping review. Keep generated
 checker state, downloaded tools, and bulky logs out of Git. Start with a terminal
 trace/table; a visual trace viewer is optional after the full workflow works.
 
 ## Implementation milestones
 
-1. **Numerical baseline:** full recomputation and local cached decoding agree.
+1. **Numerical baseline (implemented):** full recomputation and local cached
+   decoding agree. See [setup and tests](README.md) for the regression tests,
+   including both prompts through two generated tokens at explicit tolerances.
 2. **Real staged transfers:** block copies through separate pools preserve scores;
    two requests exercise allocation and reuse.
 3. **Protocol specification:** write the action mapping, assumptions, TLA+ model,

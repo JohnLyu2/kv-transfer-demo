@@ -9,7 +9,8 @@
 - Previous planning reference: `622f9b5f5f4ca6308c33050923f97dadb643dbb1`
 
 This is a source-review mapping for a planned demo, not verified equivalence.
-The demo has not yet been implemented. Neither production tests nor hardware
+The local numerical baseline is implemented; staged transfers and the formal
+model remain planned. Neither production tests nor hardware
 verification were performed for this update. The pin is a reproducible source
 reference, not a declaration of deployment stability.
 
