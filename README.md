@@ -1,16 +1,159 @@
-# KV transfer demo
+# Formal verification of KV-cache transfers
 
-A CPU-only educational demo of KV-cache transfer correctness. The numerical
-baseline and staged transfers are implemented: two requests transfer actual K/V
-through reusable staging into paged destination storage, then decode with scores
-matching full causal recomputation. Cancellation drains submitted stages before
-retirement. Formal checks and checker trace replay remain planned in [PLAN.md](PLAN.md).
+A research project on formal verification of KV-cache transfer protocols for
+LLM serving. It investigates correct cache reads, safe memory reuse, and progress
+guarantees under asynchronous transfers, request cancellation, and delayed
+completion notifications.
 
-## Run the demo and tests
+## Background
 
-The reference environment is Python 3.13.5 (also recorded in `.python-version`),
-with NumPy 2.2.6. The test runner is Python's built-in `unittest`.
-From the repository root:
+An autoregressive language model generates tokens one at a time. Attention uses
+key and value tensors from earlier tokens; retaining them in a **KV cache** avoids
+recomputing them at every step. **Prefill** processes the prompt and builds the
+cache. **Decode** uses and extends it as new tokens are generated. Running these
+phases on separate workers is called **prefill–decode disaggregation**: the
+prefill worker transfers its cache so the decode worker can continue the computation.
+
+[TPU Sync](third_party/tpu-sync/README.md) manages KV caches and data transfers on
+Cloud TPUs. It moves data between **accelerator memory** (the TPU's high-bandwidth
+memory used by attention), **host memory** (the machine's system RAM, used for
+staging or cache storage), and **remote workers** (serving processes on other
+machines, reached over the network).
+
+This project uses TPU Sync at Git commit
+`6852486862ad644c2e9febb26d0f5e75be13c981` as its fixed implementation reference.
+It studies a **simplified abstraction of a staged transfer route**:
+
+```text
+Prefill worker           Reusable host staging          Decode worker
+Producer K/V arrays  ->  Staging buffers            ->  Destination K/V arrays
+                                                       |
+                                                       v
+                                                   Attention and decoding
+```
+
+The [source mapping](docs/tpu-sync-mapping.md) documents how the abstraction
+relates to this implementation.
+
+## The verification problem
+
+> When can a consumer use transferred KV data, and when can its storage be reused?
+
+Requests share a finite pool of staging buffers, and a block copy progresses in
+pieces: some token rows may arrive before others. Reusing a staging buffer while
+a pending copy still reads it can cause that copy to transfer another request's
+data. Cancelling a request does not stop an already-submitted copy.
+
+A transfer can also finish before the client learns that it is complete.
+The protocol must distinguish completion of the copy from reporting its outcome,
+and keep buffers protected for as long as a transfer may access them.
+
+These behaviors require separate rules for **readiness, ownership, cancellation,
+and reuse**:
+
+- Every successful consumer read returns the complete KV data for the intended
+  request and logical block. A request's KV cache can span multiple blocks that
+  arrive in any order; decoding requires all of them to be ready and read in token order.
+- Reservations prevent storage reuse while copies are in progress. Generation
+  numbers identify each use of a slot so software can reject stale references.
+- Publication makes completed destination data readable. Cancellation withdraws
+  consumer access and prevents subsequent publication; submitted work drains
+  before its storage is released.
+- Completion records report outcomes; reading them does not advance transfers
+  or grant permission to access or release memory.
+
+## Verification approach and rationale
+
+### Model event ordering and data identity
+
+The correctness questions depend on the order of reads, writes, and buffer reuse.
+A TLA+ state machine makes those dependencies explicit through actions for copy
+progress, completion, publication, cancellation, and release. TLC explores all
+reachable states within a finite configuration, checking safety properties
+across the allowed event orderings.
+
+The model tracks logical data identity, physical slots and their allocation
+generations, and outstanding operations. Symbolic labels replace numerical
+K/V rows because the properties concern data identity and completeness. Each copy
+propagates the label actually at its source, so overwritten staging produces
+incorrect destination data. This assumes that individual copies faithfully
+transfer their source contents.
+
+The verification design uses small configurations with competing requests,
+KV caches spanning multiple blocks, partial copies, and buffer reuse to keep
+systematic exploration practical. Deliberately weakening a rule, such as
+allowing early publication, lets the checker produce an exact sequence showing
+why that rule matters.
+
+### Distinguish safety from progress
+
+A protocol that prevents every read could satisfy read safety without serving
+any requests. Reachability checks therefore require successful reads and safe
+retirement to be possible. Proving that they eventually occur is a separate
+liveness question, requiring explicit assumptions about fair scheduling and
+physical transfer completion.
+
+### Relate counterexamples to inference
+
+A deterministic simulator executes selected events over actual K/V tensors in
+separate producer, staging, and destination arrays. Logical block tables recover
+token order from scattered storage. A small attention model computes next-token
+scores from the transferred cache and compares them with full recomputation
+from the same token history. Comparing every score can expose errors even when
+the selected token is unchanged.
+
+The intended replay workflow follows model-checker counterexamples through
+concrete copies to incorrect data and, when consumed, incorrect scores. A
+cancelled request need not decode to expose a violation: an outstanding copy
+accessing reused storage is already an error.
+
+## Scope and research direction
+
+Verification targets the abstract protocol. Bounded checks establish properties
+only for the stated configurations; numerical tests and trace replay do not prove
+implementation refinement. The model also separates events that TPU Sync handles
+consecutively within a callback, so not every modeled interleaving is established
+to occur in that implementation. Hardware memory ordering, transport failures,
+retries, and crash recovery are outside this abstraction. No production
+correctness or performance claim follows from these checks.
+
+The core plan is to specify and check transfers of KV caches spanning multiple
+blocks, including out-of-order arrival, readiness of the entire cache,
+cancellation, and safe reuse. Numerical validation and counterexample replay
+connect the verified properties to executable behavior. Broader research
+directions include liveness verification, refinement proofs connecting
+implementations to the contract, and evaluation across representative serving systems.
+
+The intended outcome is a reproducible case study for an ICLR blog post and a
+foundation for a broader formal-methods or ML-systems contribution. That research
+goal requires generalizable contracts or verification methods and evidence beyond
+a single small model. The [project plan](PLAN.md) defines the core artifact's
+design and completion criteria; [formal results](formal/results.md) record the
+exact checks and their bounds.
+
+## Quick start
+
+### Bounded formal checks
+
+With Java 11 or newer and Python 3 available:
+
+```sh
+sh tooling/check_model.sh --download
+sh tooling/check_model.sh
+```
+
+The first command downloads the pinned TLC jar if needed; subsequent runs use
+the verified local copy. For offline use, pass `--jar /path/to/tla2tools.jar`.
+Logs, configurations, witness traces, and `summary.json` go to
+`.cache/tlc/latest/`, or the directory selected with `--output PATH`.
+`--timeout SECONDS` sets the per-check limit. Incomplete safety searches,
+unexpected violations, and checker errors cause the runner to fail.
+
+### Numerical demo and tests
+
+The demo runs on a laptop without accelerators or model downloads. The reference
+environment is Python 3.13.5 and NumPy 2.2.6. From the repository root, create an
+environment and run the demo and tests:
 
 ```sh
 python3 -m venv .venv
@@ -19,149 +162,21 @@ python3 -m venv .venv
 .venv/bin/python -m unittest discover -s tests -v
 ```
 
-No TPU Sync initialization, dependencies, build, model downloads, or accelerator
-are required. The optional submodule is only a source reference; see the
-[production mapping](docs/tpu-sync-mapping.md).
-
-Expected demo output (the final floating-point digits can vary by platform):
-
-```text
-A: logical blocks -> physical slots [5, 1, 7, 3]; generated [4, 4]
-B: logical blocks -> physical slots [0, 6, 2, 4]; generated [4, 4]
-PASS: 6 blocks transferred; 66 events; max score error 8.882e-16
-Both staging slots are free; destination blocks remain owned until request retirement.
-```
-
-Add `--trace` to print each event, transfer ID, copy-piece index, and staging and
-destination slot generations. An invalid event raises `ProtocolError` and stops
-the schedule; it is never silently skipped.
-
-## Staged transfers and block tables
-
-`protocol.py` implements separate producer snapshots, a two-slot staging pool,
-and an eight-slot destination pool. A block holds two tokens, with separate key
-and value widths. The demo gives A physical slots `[5, 1, 7]` and B `[0, 6, 2]`,
-then transfers logical blocks in order `[2, 0, 1]`. Both requests have copies in
-flight together. A single thread advances explicitly selected events; no sleeps,
-network calls, or background transfers are involved.
-
-For each block, the scheduler executes:
-
-```text
-reserve staging and destination
-  -> copy each producer K/V row to staging
-  -> complete_staging
-  -> start_destination
-  -> copy each staging K/V row to destination
-  -> complete_destination
-```
-
-Exclusive reservations protect staging and destination until physical completion
-is recorded, even after the last row-copy event. Producer snapshots remain
-read-only for the request's lifetime. After completion, `release_staging` permits
-reuse; `notify` records a completion outcome; `publish` makes the destination
-block readable after notification. Staging release can occur before notification:
-the demo deliberately reassigns staging slots before delivering old notifications.
-Generation checks reject stale physical references, and notifications never
-release staging on behalf of a newer transfer.
-
-`poll()` consumes outcomes and changes no copy, readiness, or reservation state.
-`gather()` refuses an incomplete context, then follows the request's block table
-in logical order and returns independent contiguous arrays for attention. This
-models paged KV storage, not the production PagedAttention kernel. Padding in a
-partial final block is excluded using the request's token count.
-
-Each generated token's K/V is appended to destination storage: a partial block is
-filled first, then a new block is allocated when necessary. Scores are checked
-from freshly gathered destination data before generation and after both decode
-steps. `release_request()` frees a fully published, retired request's destination
-blocks, or a cancelled request's blocks after its submitted copies have drained
-and staging has been released. Request and transfer IDs are unique
-for one manager lifetime. Access rules assume callers use the checked methods;
-the backing arrays are exposed for inspection, not concurrent external mutation.
-
-## Cancellation and safe retirement
+The demo compares decoding scores against full recomputation and reports the
+maximum error. To inspect cancellation, safe retirement, and slot reuse:
 
 ```sh
 .venv/bin/python -m kv_transfer_demo.demo --cancel --trace
 ```
 
-This smaller scenario uses two-token prompts: A is cancelled after one destination
-row is copied. B finishes its transfer while A still holds its reservations.
-A's remaining copy drains, its staging is released, and A is retired. C then
-reuses A's staging and destination slots with new generations before A's delayed
-notification arrives. B and C both decode two tokens with reference-equivalent
-scores. A is never decoded or published. The scenario has 34 events.
+`--trace` prints the scheduled events and allocation generations. Invalid events
+raise an error instead of being silently skipped. The demos require no TPU Sync
+build or initialization.
 
-`RequestEvent("cancel", request_id)` invokes `cancel_request()`; cancellation
-withdraws request interest, clears readiness, and forbids new plans, reservations,
-destination-stage starts, publication, gathering, and appending for that request.
-It does not abort a submitted copy or free memory still being accessed:
+## Further reading
 
-| Phase when cancelled | Required work before retirement |
-| --- | --- |
-| `planned` | No copy was submitted; mark discarded without allocating staging |
-| `producer` | Finish remaining producer-to-staging pieces and `complete_staging`; discard without starting H2D |
-| `staged` | Producer copy is complete and H2D has not started; discard |
-| `destination` | Finish remaining staging-to-destination pieces and `complete_destination` |
-| `complete` | No physical copy remains; release staging if still allocated |
-
-`reserve` is the modeled submission point for the producer stage.
-`start_destination` is the submission point for the device copy; it is separate
-from `complete_staging` so cancellation can occur between stages. For a draining
-stage, reservations remain held even after its last piece until its completion
-event. Discarded transfers have no remaining physical accesses, but their data
-must not be published. Staging that was allocated still needs `release_staging`.
-
-`RequestEvent("retire", request_id)` invokes `release_request()` and rejects
-retirement while any stage or staging allocation remains outstanding. Cancelled
-transfers retain only metadata after retirement, allowing a single late `notify`
-to report an Outcome with status `cancelled` without touching old physical slots.
-Normal outcomes have status `completed`. Previously delivered outcomes and
-publication flags remain historical facts if cancellation follows them; they do
-not authorize access. Polling never changes readiness or memory ownership.
-
-This is the demo's chosen cancellation policy, not a verified description of
-every production TPU Sync path. Copy failures, retries, and physical aborts are
-not modeled. Drain and retirement require their explicit scheduled events; there
-is no background worker providing a liveness guarantee.
-
-## Numerical model
-
-`TinyAttention` uses a 16-token vocabulary, embedding dimension 8, one causal attention
-head, seeded fixed weights, and a sinusoidal positional embedding table of length 32.
-It uses fixed synthetic weights to exercise KV-cache correctness, with no MLP or
-residual connection. Generated token IDs are not meaningful text. Computation
-uses float64.
-
-Positions are independent of the random seed. For position `p` and dimension
-pair `i`, the table uses `sin(p / 10000^(2i/8))` in dimension `2i` and
-`cos(p / 10000^(2i/8))` in dimension `2i+1`. Token embeddings and projection
-weights remain seeded and synthetic.
-
-The code names three dimensions separately, all defaulting to 8:
-`model_dim` for embeddings, `qk_dim` for queries and keys, and `value_dim` for
-values. Q and K share a width for their dot product; V may have a different width.
-`Wq` and `Wk` have shape `(model_dim, qk_dim)`, `Wv` has shape
-`(model_dim, value_dim)`, and the output projection has shape
-`(value_dim, vocab_size)`. Attention scores are scaled by `sqrt(qk_dim)`.
-
-- `reference(tokens)` recomputes all causal positions without a cache. Each row
-  contains logits predicting the following token.
-- `prefill(tokens)` returns next-token logits and token-major K/V arrays.
-- `decode(token, cache)` computes only the new token's Q/K/V, appends its K/V to
-  fresh arrays, and returns logits for the next token and the extended cache.
-- `cached_scores(last_token, cache)` scores an existing, possibly transferred
-  context without rebuilding or appending K/V. The caller supplies the actual
-  final token of that context.
-
-For prompts `(1, 4, 2, 8, 3, 7)` and `(9, 5, 12, 6, 10, 14)`, tests compare all
-16 scores before each argmax selection and after appending each of two generated
-tokens. Both paths follow the same token history, with `rtol=1e-12` and
-`atol=1e-12`. Tests also check causal masking, cache independence, context limits,
-and that corrupting either K or V produces a detectable score mismatch.
-
-Protocol tests also cover early access, conflicting reservations, pool exhaustion,
-stale generations, delayed notifications, partial blocks, and deterministic event
-order. These are executable regression checks; no formal proof or verification of
-TPU Sync is claimed. A versioned TLA+ trace importer remains future work.
+- [Project plan](PLAN.md): detailed design, demonstrations, and completion criteria.
+- [TPU Sync mapping](docs/tpu-sync-mapping.md): production references and abstractions.
+- [Formal assumptions](formal/assumptions.md): execution assumptions and model bounds.
+- [Action mapping](formal/action-mapping.md): correspondence between Python and TLA+.
+- [Formal results](formal/results.md): recorded checks and reproduction details.
