@@ -9,8 +9,8 @@
 - Previous planning reference: `622f9b5f5f4ca6308c33050923f97dadb643dbb1`
 
 This is a source-review mapping for a planned demo, not verified equivalence.
-The local numerical baseline is implemented; staged transfers and the formal
-model remain planned. Neither production tests nor hardware
+The local numerical baseline and staged-transfer scenario are implemented;
+cancellation and the formal model remain planned. Neither production tests nor hardware
 verification were performed for this update. The pin is a reproducible source
 reference, not a declaration of deployment stability.
 
@@ -68,6 +68,22 @@ formal model.
   demo access/lifetime contract.
 - Resharding, weight synchronization, telemetry, crash recovery, prefix sharing,
   and distributed registry behavior are excluded from the first version.
+
+## Implemented milestone 2 correspondence
+
+[The transfer protocol](../src/kv_transfer_demo/protocol.py) now provides finite
+staging/destination pools, allocation generations, exclusive reservations,
+per-request logical block tables, and explicit completion/notification/publication
+events. [The scheduler](../src/kv_transfer_demo/scheduler.py) runs selected events
+and rejects unmet preconditions. [The CPU scenario](../src/kv_transfer_demo/demo.py)
+interleaves two requests and delays notifications until staging has been reused.
+
+Logical block tables model the storage indirection associated with PagedAttention.
+The consumer gathers blocks into contiguous NumPy snapshots for ordinary attention;
+it does not implement the production paged attention kernel or its performance
+characteristics. Source arrays remain immutable, and exclusive reservations are
+more conservative than production mechanisms. Regression tests exercise this demo
+implementation; they do not establish production equivalence or cover cancellation.
 
 ## Optional checkout and deliberate updates
 

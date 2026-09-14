@@ -111,6 +111,13 @@ the arrays do not accidentally alias. Begin with two reusable staging slots and
 enough destination blocks for both short requests and their generated tokens.
 Staging scarcity provides contention without introducing an eviction policy.
 
+Each request has a block table mapping logical token-block indices to physical
+destination slots. Exercise noncontiguous, nonmonotonic allocations and transfer
+blocks out of logical order. Gather ready blocks through that table in token
+order for the numerical attention model; this implements paged storage semantics,
+not a production PagedAttention kernel. Track the valid token count to exclude
+padding in partial blocks and allocate a new destination block as decoding grows.
+
 Identify logical data by `(cache_key, block_index, piece_index)`, independently
 of the request using it. Identify physical storage by `(pool, slot, generation)`.
 The demo assumes correct cache-key assignment and one fixed model configuration.
@@ -286,8 +293,10 @@ trace/table; a visual trace viewer is optional after the full workflow works.
 1. **Numerical baseline (implemented):** full recomputation and local cached
    decoding agree. See [setup and tests](README.md) for the regression tests,
    including both prompts through two generated tokens at explicit tolerances.
-2. **Real staged transfers:** block copies through separate pools preserve scores;
-   two requests exercise allocation and reuse.
+2. **Real staged transfers (implemented):** block copies through separate pools
+   preserve scores; two requests exercise scattered block tables, staging reuse,
+   delayed notifications, and destination growth. The CPU-only demo and protocol
+   regression tests run through the [documented commands](README.md).
 3. **Protocol specification:** write the action mapping, assumptions, TLA+ model,
    and bounded configurations; verify the correct variant.
 4. **Counterexamples:** weaken publication and cancellation cleanup separately;
@@ -299,6 +308,13 @@ At the end of milestone 2, confirm that the demo remains small and CPU-only. At
 milestone 3, validate non-vacuity: the model must reach successful transfers,
 reads, cancellation, and slot reuse, rather than passing because useful work is
 disabled. Do not add more production features before counterexample replay works.
+
+Current implementation boundary: staging and destination reservations are
+exclusive; producer snapshots remain immutable. Events distinguish physical
+completion, notification, publication, and outcome polling. Cancellation and
+intentional faulty variants are not implemented yet and must be added before
+claiming demonstrations A/B or the cancellation portion of C. No TLC results or
+model-to-executable trace correspondence are claimed at this milestone.
 
 ## Completion criteria
 

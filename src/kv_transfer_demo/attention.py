@@ -102,19 +102,36 @@ class TinyAttention:
         cache = KVCache(keys=x @ self.wk, values=x @ self.wv)
         return self._next_scores(x[-1] @ self.wq, cache), cache
 
-    def decode(self, token: int, cache: KVCache) -> tuple[FloatArray, KVCache]:
-        """Append one token at position len(cache), returning subsequent logits.
-
-        Only the new token's Q/K/V are computed; previous K/V come from the cache.
-        """
-        ids = self._tokens([token])
+    def _cache_length(self, cache: KVCache) -> int:
         if (cache.keys.ndim != 2 or cache.values.ndim != 2
                 or len(cache.keys) != len(cache.values)
                 or cache.keys.shape[1] != self.qk_dim
                 or cache.values.shape[1] != self.value_dim):
             raise ValueError("Expected keys (length, qk_dim) and values (length, value_dim)")
         length = len(cache.keys)
-        if not 1 <= length < self.max_context:
+        if not 1 <= length <= self.max_context:
+            raise ValueError("Cache length is outside the model context bounds")
+        return length
+
+    def cached_scores(self, last_token: int, cache: KVCache) -> FloatArray:
+        """Score an existing context using its K/V, without appending a token.
+
+        last_token must be the token at the final position of this cache.
+        This lets a consumer score transferred data without rebuilding prompt K/V.
+        """
+        ids = self._tokens([last_token])
+        length = self._cache_length(cache)
+        x = self.embedding[ids[0]] + self.position[length - 1]
+        return self._next_scores(x @ self.wq, cache)
+
+    def decode(self, token: int, cache: KVCache) -> tuple[FloatArray, KVCache]:
+        """Append one token at position len(cache), returning subsequent logits.
+
+        Only the new token's Q/K/V are computed; previous K/V come from the cache.
+        """
+        ids = self._tokens([token])
+        length = self._cache_length(cache)
+        if length == self.max_context:
             raise ValueError("Cache must be nonempty and have room for one token")
         x = self.embedding[ids[0]] + self.position[length]
         updated = KVCache(
