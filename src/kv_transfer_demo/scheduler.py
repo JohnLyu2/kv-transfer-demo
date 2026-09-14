@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 from collections.abc import Iterable
 
-from .protocol import SlotRef, TransferManager
+from .protocol import ProtocolError, SlotRef, TransferManager
 
 
 @dataclass(frozen=True)
@@ -14,12 +14,20 @@ class Event:
 
 
 @dataclass(frozen=True)
-class TraceEntry:
-    event: Event
+class RequestEvent:
+    """A request-wide cancel or retire action, independent of any one transfer."""
+
+    action: str
     request_id: str
-    block: int
+
+
+@dataclass(frozen=True)
+class TraceEntry:
+    event: Event | RequestEvent
+    request_id: str
+    block: int | None
     staging: SlotRef | None
-    destination: SlotRef
+    destination: SlotRef | None
 
 
 class Scheduler:
@@ -29,8 +37,17 @@ class Scheduler:
         self.manager = manager
         self.trace: list[TraceEntry] = []
 
-    def run(self, events: Iterable[Event]) -> None:
+    def run(self, events: Iterable[Event | RequestEvent]) -> None:
         for event in events:
+            if isinstance(event, RequestEvent):
+                if event.action == "cancel":
+                    self.manager.cancel_request(event.request_id)
+                elif event.action == "retire":
+                    self.manager.release_request(event.request_id)
+                else:
+                    raise ProtocolError(f"Unknown request action: {event.action}")
+                self.trace.append(TraceEntry(event, event.request_id, None, None, None))
+                continue
             self.manager.step(event.action, event.transfer_id, event.piece)
             transfer = self.manager.transfers[event.transfer_id]
             self.trace.append(TraceEntry(event, transfer.request_id, transfer.block,

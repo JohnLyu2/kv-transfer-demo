@@ -9,8 +9,8 @@
 - Previous planning reference: `622f9b5f5f4ca6308c33050923f97dadb643dbb1`
 
 This is a source-review mapping for a planned demo, not verified equivalence.
-The local numerical baseline and staged-transfer scenario are implemented;
-cancellation and the formal model remain planned. Neither production tests nor hardware
+The local numerical baseline, staged transfers, and cancellation with safe
+retirement are implemented; the formal model remains planned. Neither production tests nor hardware
 verification were performed for this update. The pin is a reproducible source
 reference, not a declaration of deployment stability.
 
@@ -83,7 +83,15 @@ The consumer gathers blocks into contiguous NumPy snapshots for ordinary attenti
 it does not implement the production paged attention kernel or its performance
 characteristics. Source arrays remain immutable, and exclusive reservations are
 more conservative than production mechanisms. Regression tests exercise this demo
-implementation; they do not establish production equivalence or cover cancellation.
+implementation; they do not establish production equivalence.
+
+The cancellation scenario implements the chosen drain-before-retirement policy.
+It separates producer completion from destination-stage submission, withdraws
+consumer access on cancellation, and allows cancelled completion notifications
+after retirement without touching old slot references. Tests cover cancellation
+at every event boundary, partial drains, multiple transfers, and slot reuse. This
+is executable evidence for the demo rules, not a claim about production failure,
+timeout, or cancellation semantics. No formal safety or liveness result is claimed.
 
 ## Optional checkout and deliberate updates
 

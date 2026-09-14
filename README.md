@@ -3,8 +3,8 @@
 A CPU-only educational demo of KV-cache transfer correctness. The numerical
 baseline and staged transfers are implemented: two requests transfer actual K/V
 through reusable staging into paged destination storage, then decode with scores
-matching full causal recomputation. Cancellation, formal checks, and checker trace
-replay remain planned in [PLAN.md](PLAN.md).
+matching full causal recomputation. Cancellation drains submitted stages before
+retirement. Formal checks and checker trace replay remain planned in [PLAN.md](PLAN.md).
 
 ## Run the demo and tests
 
@@ -28,7 +28,7 @@ Expected demo output (the final floating-point digits can vary by platform):
 ```text
 A: logical blocks -> physical slots [5, 1, 7, 3]; generated [4, 4]
 B: logical blocks -> physical slots [0, 6, 2, 4]; generated [4, 4]
-PASS: 6 blocks transferred; 60 events; max score error 8.882e-16
+PASS: 6 blocks transferred; 66 events; max score error 8.882e-16
 Both staging slots are free; destination blocks remain owned until request retirement.
 ```
 
@@ -51,6 +51,7 @@ For each block, the scheduler executes:
 reserve staging and destination
   -> copy each producer K/V row to staging
   -> complete_staging
+  -> start_destination
   -> copy each staging K/V row to destination
   -> complete_destination
 ```
@@ -74,9 +75,56 @@ Each generated token's K/V is appended to destination storage: a partial block i
 filled first, then a new block is allocated when necessary. Scores are checked
 from freshly gathered destination data before generation and after both decode
 steps. `release_request()` frees a fully published, retired request's destination
-blocks; it cannot cancel an in-flight request. Request and transfer IDs are unique
+blocks, or a cancelled request's blocks after its submitted copies have drained
+and staging has been released. Request and transfer IDs are unique
 for one manager lifetime. Access rules assume callers use the checked methods;
 the backing arrays are exposed for inspection, not concurrent external mutation.
+
+## Cancellation and safe retirement
+
+```sh
+.venv/bin/python -m kv_transfer_demo.demo --cancel --trace
+```
+
+This smaller scenario uses two-token prompts: A is cancelled after one destination
+row is copied. B finishes its transfer while A still holds its reservations.
+A's remaining copy drains, its staging is released, and A is retired. C then
+reuses A's staging and destination slots with new generations before A's delayed
+notification arrives. B and C both decode two tokens with reference-equivalent
+scores. A is never decoded or published. The scenario has 34 events.
+
+`RequestEvent("cancel", request_id)` invokes `cancel_request()`; cancellation
+withdraws request interest, clears readiness, and forbids new plans, reservations,
+destination-stage starts, publication, gathering, and appending for that request.
+It does not abort a submitted copy or free memory still being accessed:
+
+| Phase when cancelled | Required work before retirement |
+| --- | --- |
+| `planned` | No copy was submitted; mark discarded without allocating staging |
+| `producer` | Finish remaining producer-to-staging pieces and `complete_staging`; discard without starting H2D |
+| `staged` | Producer copy is complete and H2D has not started; discard |
+| `destination` | Finish remaining staging-to-destination pieces and `complete_destination` |
+| `complete` | No physical copy remains; release staging if still allocated |
+
+`reserve` is the modeled submission point for the producer stage.
+`start_destination` is the submission point for the device copy; it is separate
+from `complete_staging` so cancellation can occur between stages. For a draining
+stage, reservations remain held even after its last piece until its completion
+event. Discarded transfers have no remaining physical accesses, but their data
+must not be published. Staging that was allocated still needs `release_staging`.
+
+`RequestEvent("retire", request_id)` invokes `release_request()` and rejects
+retirement while any stage or staging allocation remains outstanding. Cancelled
+transfers retain only metadata after retirement, allowing a single late `notify`
+to report an Outcome with status `cancelled` without touching old physical slots.
+Normal outcomes have status `completed`. Previously delivered outcomes and
+publication flags remain historical facts if cancellation follows them; they do
+not authorize access. Polling never changes readiness or memory ownership.
+
+This is the demo's chosen cancellation policy, not a verified description of
+every production TPU Sync path. Copy failures, retries, and physical aborts are
+not modeled. Drain and retirement require their explicit scheduled events; there
+is no background worker providing a liveness guarantee.
 
 ## Numerical model
 

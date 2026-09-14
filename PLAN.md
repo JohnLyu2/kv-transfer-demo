@@ -311,10 +311,13 @@ disabled. Do not add more production features before counterexample replay works
 
 Current implementation boundary: staging and destination reservations are
 exclusive; producer snapshots remain immutable. Events distinguish physical
-completion, notification, publication, and outcome polling. Cancellation and
-intentional faulty variants are not implemented yet and must be added before
-claiming demonstrations A/B or the cancellation portion of C. No TLC results or
-model-to-executable trace correspondence are claimed at this milestone.
+completion, notification, publication, and outcome polling. Cancellation and safe
+retirement are implemented, including tests at every transfer-event boundary and
+a runnable cancellation/reuse scenario. `complete_staging` and `start_destination`
+are separate events; cancelled producer stages drain without starting the latter.
+Cancelled notifications can arrive after retirement and slot reuse, reporting
+historical outcomes without accessing storage. Intentional faulty variants,
+TLC checking, and model-to-executable trace correspondence remain future work.
 
 ## Completion criteria
 

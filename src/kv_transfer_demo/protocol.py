@@ -1,7 +1,8 @@
 """Deterministic staged copies and paged KV storage, with checked access rules.
 
 All accesses go through this interface. Reservations are exclusive and more
-conservative than production reader/writer pins. Cancellation is not modeled yet.
+conservative than production reader/writer pins. Cancellation drains submitted
+stages before storage can be retired; it does not abort physical copies.
 """
 
 from dataclasses import dataclass, field
@@ -127,12 +128,17 @@ class Request:
     {2} means the block in slot 7 is published. gather() requires every
     context block to be ready. The default factory gives each request its
     own initially empty set.
+
+    cancelled records withdrawn interest. Cancellation clears ready and blocks
+    later gather/append operations; source and blocks stay owned until submitted
+    transfers drain and release_request() can retire the request safely.
     """
 
     source: KVCache
     length: int
     blocks: list[SlotRef]
     ready: set[int] = field(default_factory=set)
+    cancelled: bool = False
 
 
 @dataclass
@@ -148,7 +154,8 @@ class Transfer:
 
     TransferManager.step() advances the copy phase through explicit events:
         planned -> reserve -> producer
-        producer -> complete_staging -> destination
+        producer -> complete_staging -> staged
+        staged -> start_destination -> destination
         destination -> complete_destination -> complete
     In the producer phase, producer_pieces records row indices copied into
     staging. In the destination phase, destination_pieces records row indices
@@ -157,7 +164,7 @@ class Transfer:
 
     After complete_destination removes both reservations and sets the phase
     to complete, three separate flags track the remaining lifecycle:
-        staging_released: release_staging returned the staging slot to its pool.
+        staging_released: staging was returned, or never allocated before discard.
         notified: notify recorded an Outcome for client polling.
         published: publish added this logical block to the request's ready set.
     Publication requires notification, and notification requires completion.
@@ -165,6 +172,14 @@ class Transfer:
     and publication. The demo releases staging first, reuses it, then notifies
     and publishes the old transfer. Its retained staging reference therefore
     describes the old allocation and may no longer be valid for memory access.
+
+    Cancellation marks this record permanently, even after request retirement.
+    A planned or staged transfer becomes discarded; a producer-stage copy
+    drains before becoming discarded. A submitted destination copy drains
+    to complete. Discarded means no copy remains that can access storage,
+    not that destination data is valid. Cancelled transfers cannot publish.
+    If publication preceded cancellation, published remains historical metadata;
+    cancellation clears Request.ready and withdraws current consumer access.
 
     This record stores progress; TransferManager.step() enforces the rules.
     """
@@ -180,14 +195,23 @@ class Transfer:
     notified: bool = False
     published: bool = False
     staging_released: bool = False
+    cancelled: bool = False
 
 
 @dataclass(frozen=True)
 class Outcome:
+    """Historical notification, not a storage reservation or readiness grant.
+
+    status is completed or cancelled at delivery time. A later cancellation
+    does not rewrite previously delivered outcomes. A cancelled outcome may
+    refer to storage already retired and reallocated; do not dereference it.
+    """
+
     transfer_id: str
     request_id: str
     block: int
     destination: SlotRef
+    status: str = "completed"
 
 
 class TransferManager:
@@ -202,6 +226,7 @@ class TransferManager:
         self.requests: dict[str, Request] = {}
         self.transfers: dict[str, Transfer] = {}
         self._outcomes: list[Outcome] = []
+        self._request_ids: set[str] = set()
 
     def add_request(self, request_id: str, cache: KVCache,
                     slots: list[int]) -> None:
@@ -215,8 +240,7 @@ class TransferManager:
                 or cache.values.shape[1] != self.destination.values.shape[2]):
             raise ProtocolError("Invalid producer K/V shape")
         count = (len(cache.keys) + self.block_size - 1) // self.block_size
-        if (request_id in self.requests
-                or any(t.request_id == request_id for t in self.transfers.values())
+        if (request_id in self._request_ids
                 or len(slots) != count
                 or len(set(slots)) != count
                 or any(slot not in self.destination.free_slots for slot in slots)):
@@ -226,10 +250,11 @@ class TransferManager:
         source.values.flags.writeable = False
         blocks = [self.destination.allocate(slot) for slot in slots]
         self.requests[request_id] = Request(source, len(source.keys), blocks)
+        self._request_ids.add(request_id)
 
     def plan(self, transfer_id: str, request_id: str, block: int) -> None:
         request = self.requests.get(request_id)
-        if (transfer_id in self.transfers or request is None
+        if (transfer_id in self.transfers or request is None or request.cancelled
                 or not 0 <= block < len(request.blocks) or block in request.ready
                 or any(t.request_id == request_id and t.block == block
                        for t in self.transfers.values())):
@@ -245,14 +270,23 @@ class TransferManager:
         if transfer_id not in self.transfers:
             raise ProtocolError("Unknown transfer")
         transfer = self.transfers[transfer_id]
+        if action not in ("copy_to_staging", "copy_to_destination") and piece is not None:
+            raise ProtocolError("Only copy events accept a piece index")
+        # Cancelled tombstones can report a drained result after request retirement.
+        # This path only records metadata: it must not touch either physical slot.
+        if action == "notify" and transfer.cancelled:
+            if transfer.phase not in ("complete", "discarded") or transfer.notified:
+                raise ProtocolError("Cancelled completion notification is not enabled")
+            self._outcomes.append(Outcome(transfer_id, transfer.request_id,
+                                          transfer.block, transfer.destination, "cancelled"))
+            transfer.notified = True
+            return
         request = self.requests.get(transfer.request_id)
         if (request is None or request.blocks[transfer.block] != transfer.destination):
             raise ProtocolError("Transfer no longer owns its destination mapping")
-        if action not in ("copy_to_staging", "copy_to_destination") and piece is not None:
-            raise ProtocolError("Only copy events accept a piece index")
 
         if action == "reserve":
-            if transfer.phase != "planned":
+            if request.cancelled or transfer.phase != "planned":
                 raise ProtocolError("Transfer already reserved")
             self.destination.check(transfer.destination)
             staging = self.staging.allocate()
@@ -279,6 +313,13 @@ class TransferManager:
         elif action == "complete_staging":
             if transfer.phase != "producer" or len(transfer.producer_pieces) != transfer.pieces:
                 raise ProtocolError("Producer-to-staging copy is incomplete")
+            if transfer.cancelled:
+                self._discard(transfer_id, transfer)
+            else:
+                transfer.phase = "staged"
+        elif action == "start_destination":
+            if request.cancelled or transfer.phase != "staged":
+                raise ProtocolError("Destination stage cannot start")
             transfer.phase = "destination"
         elif action == "complete_destination":
             if (transfer.phase != "destination"
@@ -288,7 +329,7 @@ class TransferManager:
             self.destination.unreserve(transfer.destination, transfer_id)
             transfer.phase = "complete"
         elif action == "release_staging":
-            if transfer.phase != "complete" or transfer.staging_released:
+            if transfer.phase not in ("complete", "discarded") or transfer.staging_released:
                 raise ProtocolError("Staging cannot be released yet or was already released")
             self.staging.release(transfer.staging)
             transfer.staging_released = True
@@ -300,7 +341,7 @@ class TransferManager:
                                           transfer.block, transfer.destination))
             transfer.notified = True
         elif action == "publish":
-            if not transfer.notified or transfer.published:
+            if request.cancelled or not transfer.notified or transfer.published:
                 raise ProtocolError("Publication requires a delivered completion")
             self.destination.check(transfer.destination)
             request.ready.add(transfer.block)
@@ -317,7 +358,7 @@ class TransferManager:
     def gather(self, request_id: str) -> KVCache:
         """Read ready blocks in logical order into an independent attention snapshot."""
         request = self.requests[request_id]
-        if request.ready != set(range(len(request.blocks))):
+        if request.cancelled or request.ready != set(range(len(request.blocks))):
             raise ProtocolError("Context is not ready")
         blocks = [self.destination.read(ref) for ref in request.blocks]
         return KVCache(np.concatenate([block.keys for block in blocks])[:request.length],
@@ -329,7 +370,7 @@ class TransferManager:
         if (data.keys.shape != (1, self.destination.keys.shape[2])
                 or data.values.shape != (1, self.destination.values.shape[2])):
             raise ProtocolError("Append requires exactly one token's K/V")
-        if request.ready != set(range(len(request.blocks))):
+        if request.cancelled or request.ready != set(range(len(request.blocks))):
             raise ProtocolError("Cannot append to an unavailable context")
         piece = request.length % self.block_size
         if piece == 0:
@@ -339,16 +380,56 @@ class TransferManager:
         request.ready.add(len(request.blocks) - 1)
         request.length += 1
 
+    def _discard(self, transfer_id: str, transfer: Transfer) -> None:
+        """Settle a cancelled transfer only when no submitted copy remains."""
+        if transfer.staging is not None:
+            self.staging.unreserve(transfer.staging, transfer_id)
+            self.destination.unreserve(transfer.destination, transfer_id)
+        else:
+            transfer.staging_released = True  # No staging was ever allocated.
+        transfer.phase = "discarded"
+
+    def cancel_request(self, request_id: str) -> None:
+        """Withdraw interest, block new stages, and drain already-submitted work.
+
+        Cancellation stops new copy stages and prevents further reads for the
+        request. Any stage already started must finish before its memory can
+        be released.
+        """
+        request = self.requests.get(request_id)
+        if request is None or request.cancelled:
+            raise ProtocolError("Unknown or already cancelled request")
+        request.cancelled = True
+        request.ready.clear()
+        for transfer_id, transfer in self.transfers.items():
+            if transfer.request_id != request_id:
+                continue
+            transfer.cancelled = True
+            if transfer.phase in ("planned", "staged"):
+                self._discard(transfer_id, transfer)
+
     def release_request(self, request_id: str) -> None:
-        """Retire a fully published request; this is not in-flight cancellation."""
-        request = self.requests[request_id]
+        """Retire a published request, or a cancelled request whose work drained.
+
+        Cancellation alone never grants retirement. Every stage must be settled
+        and staging returned first. Cancelled notification delivery may lag
+        retirement; retained transfer records handle it without accessing memory.
+        """
+        request = self.requests.get(request_id)
+        if request is None:
+            raise ProtocolError("Unknown or already retired request")
         related = [t for t in self.transfers.values() if t.request_id == request_id]
-        if (request.ready != set(range(len(request.blocks)))
-                or any(not t.published or not t.staging_released for t in related)):
+        if request.cancelled:
+            settled = all(t.phase in ("complete", "discarded") and t.staging_released
+                          for t in related)
+        else:
+            settled = (request.ready == set(range(len(request.blocks)))
+                       and all(t.published and t.staging_released for t in related))
+        if not settled:
             raise ProtocolError("Request still has outstanding work")
         for ref in request.blocks:
             self.destination.check(ref)
         for ref in request.blocks:
             self.destination.release(ref)
-        # Keep transfer IDs unique for this manager's lifetime.
+        # Keep IDs and transfer metadata, not producer arrays, after retirement.
         del self.requests[request_id]

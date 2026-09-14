@@ -12,7 +12,7 @@ from kv_transfer_demo.scheduler import Event, Scheduler
 def copy_events(transfer_id, pieces):
     return ([Event("reserve", transfer_id)]
             + [Event("copy_to_staging", transfer_id, i) for i in range(pieces)]
-            + [Event("complete_staging", transfer_id)]
+            + [Event("complete_staging", transfer_id), Event("start_destination", transfer_id)]
             + [Event("copy_to_destination", transfer_id, i) for i in range(pieces)]
             + [Event("complete_destination", transfer_id),
                Event("release_staging", transfer_id),
@@ -91,6 +91,7 @@ class ProtocolTests(unittest.TestCase):
         self.event("copy_to_staging", piece=0)
         self.event("copy_to_staging", piece=1)
         self.event("complete_staging")
+        self.event("start_destination")
         self.event("copy_to_destination", piece=0)
         with self.assertRaises(ProtocolError):
             self.event("release_staging")
