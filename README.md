@@ -1,9 +1,13 @@
 # Formal verification of KV-cache transfers
 
-A research project on formal verification of KV-cache transfer protocols for
-LLM serving. It investigates correct cache reads, safe memory reuse, and progress
-guarantees under asynchronous transfers, request cancellation, and delayed
-completion notifications.
+A formal verification demo of a simplified KV-cache transfer protocol for LLM
+serving, focused on correct cache reads and safe memory reuse under concurrent
+transfers and cancellation. The demo's scope is model checking and replayable
+counterexamples for this simplified protocol.
+
+The future plan is to apply the resulting specification, verification evidence,
+and test scenarios to real TPU Sync transfer paths, supporting production
+regression tests and protocol changes.
 
 ## Background
 
@@ -39,63 +43,65 @@ relates to this implementation.
 
 > When can a consumer use transferred KV data, and when can its storage be reused?
 
-Requests share a finite pool of staging buffers, and a block copy progresses in
-pieces: some token rows may arrive before others. Reusing a staging buffer while
-a pending copy still reads it can cause that copy to transfer another request's
-data. Cancelling a request does not stop an already-submitted copy.
+A request's KV cache can span several blocks, copied through staging buffers
+shared by competing requests. Correctness depends on coordinating four concerns:
 
-A transfer can also finish before the client learns that it is complete.
-The protocol must distinguish completion of the copy from reporting its outcome,
-and keep buffers protected for as long as a transfer may access them.
+| Concern | Why coordination is needed | Required property |
+| --- | --- | --- |
+| **Readiness and data identity** | Rows and blocks can arrive out of order, so individual copies may finish before the required cache is ready. | Every successful context read returns all required KV data for the intended request in token order. |
+| **Buffer lifetime and reuse** | Requests share storage, and outstanding copies may still access a slot proposed for reuse. | A slot is reused only after all outstanding accesses are confirmed complete; stale references cannot affect its new allocation. |
+| **Cancellation** | A request can be cancelled while its submitted copies still access memory. | Cancellation prevents new transfer stages and consumer access; submitted copies drain before storage is released, and their results are not published. |
+| **Completion reporting** | Physical completion and client observation occur separately. | Outcome reporting does not change readiness or storage ownership; polling does not advance copies. |
 
-These behaviors require separate rules for **readiness, ownership, cancellation,
-and reuse**:
+The protocol uses **reservations** to protect buffers, **publication** to make
+completed data readable, and **generation numbers** to distinguish successive
+allocations of a slot. Verification asks whether these mechanisms preserve the
+properties above across all allowed event orderings.
 
-- Every successful consumer read returns the complete KV data for the intended
-  request and logical block. A request's KV cache can span multiple blocks that
-  arrive in any order; decoding requires all of them to be ready and read in token order.
-- Reservations prevent storage reuse while copies are in progress. Generation
-  numbers identify each use of a slot so software can reject stale references.
-- Publication makes completed destination data readable. Cancellation withdraws
-  consumer access and prevents subsequent publication; submitted work drains
-  before its storage is released.
-- Completion records report outcomes; reading them does not advance transfers
-  or grant permission to access or release memory.
+## Demo plan
 
-## Demo goal
+### Goal and deliverables
 
-Build a reproducible verification case study with two outcomes:
+Build a reproducible verification case study covering competing requests, caches
+spanning multiple blocks, out-of-order arrival, partial copies, cancellation,
+and reuse. The demo should produce three reusable artifacts:
 
-1. **A checked transfer contract.** Specify competing requests whose KV caches
-   span multiple blocks, including out-of-order arrival, partial copies,
-   cancellation, and reuse. Check safety within explicit finite bounds and show
-   that successful reads and safe retirement are possible.
-2. **Replayable counterexamples.** Introduce controlled mistakes, such as early
-   publication or releasing staging on cancellation. Have TLC find failures and
-   replay them over actual K/V tensors, identifying the violated property, its
-   consequence, and the rule that prevents it. These are intentional demo faults,
-   not claims of bugs in TPU Sync.
+1. **A transfer specification.** A simplified formal model, written in TLA+,
+   describing how requests share buffers, move KV data, and respond to
+   cancellation. It represents these
+   operations as changes to abstract state, while implementation code performs
+   them on actual data and memory. The model also states requirements such as
+   keeping a buffer allocated while a copy still uses it. The model can later be
+   adapted to represent TPU Sync's actual transfer behavior and checked against
+   these requirements to identify protocol errors.
+2. **A reproducible verification suite.** Safety checks, reachability checks for
+   successful reads and reuse, and liveness checks for eventual request completion
+   or safe retirement under explicit scheduling and transfer-completion
+   assumptions, with recorded configurations and results.
+3. **A replayable scenario suite.** Successful executions and counterexamples
+   from deliberately faulty model variants, replayed in the simulator to show
+   which requirements hold or fail. Applicable scenarios can later become
+   TPU Sync regression tests.
 
-Together, these deliverables provide the basis for an ICLR blog post explaining
-the correctness problem and its verification. The [project plan](PLAN.md)
-details the design and completion criteria; [formal results](formal/results.md)
-record exact checks and bounds.
+The [project plan](PLAN.md) details the design and completion criteria;
+[formal results](formal/results.md) record exact checks and configuration limits.
 
-## Verification approach and rationale
+### Model KV-cache transfers as a state machine
 
-### Represent the protocol as states and steps
+A state machine describes a system through its possible states and the steps
+that change them. This fits KV-cache transfers because their correctness depends
+on the order in which copying, cancellation, and buffer reuse occur.
 
-A **state** is a snapshot of the whole protocol: which requests are active or
-cancelled, which rows have been copied, which blocks are ready to read, and who
-owns or reserves each buffer. A **transition** is one permitted step that changes
-that snapshot. Each step has conditions for when it can happen and rules for
-what it changes. For example:
+Here, each **state** records request status, copied rows, readable blocks, and
+buffer ownership and reservations. Each **transition** represents an operation,
+such as copying a row or cancelling a request, with conditions for when it is
+allowed and rules for how it updates the state. Examples include:
 
 | Step | When it is allowed | What changes |
 | --- | --- | --- |
 | Copy a row to the destination | The destination copy has started and holds the required buffers | One destination row receives the staging row's contents |
 | Cancel a request | The request is active | Consumer access is withdrawn; submitted copies keep their reservations |
-| Record copy completion | Every required row has been copied | The copy's reservations are released |
+| Record destination-copy completion | Every required row has reached the destination | The copy's staging and destination reservations are released |
 | Release a staging buffer | Its submitted copies have completed or been safely discarded | The buffer becomes available for reuse |
 
 An execution is a sequence of these steps. After copying one row for request A,
@@ -104,146 +110,96 @@ concurrency by allowing any enabled step, rather than prescribing one schedule.
 A whole block copy spans several steps, so cancellation and other requests can
 occur between its rows.
 
-Rows carry labels identifying their request, logical block, and position instead
-of full numerical tensors. A copy propagates the label actually at its source:
-if staging was overwritten with B's data, the destination receives B's label.
-This captures data-identity errors while keeping the state small, under the
-assumption that individual copies faithfully transfer their source contents.
+The model represents each token's K/V data **symbolically**, using a
+`(request, block, position)` label instead of numerical tensors. Assuming
+individual copies faithfully transfer their source contents, copying propagates
+the source label so the checker can detect missing or incorrect data.
 
 ### Why TLA+ and TLC
 
-**TLA+ specifies system behavior:** initial states, allowed steps, and required
-properties. **TLC checks finite instances of that specification.** A property
-that must hold in every reachable state is an **invariant**, such as keeping
-buffers reserved while copies can access them. If a property fails, TLC returns
-a **counterexample**: the sequence of steps leading to the failure.
+**TLA+ is a language used to write the formal model and its correctness
+requirements; TLC is the tool used to check them.** The choice fits this project
+for three reasons:
 
-The reason to choose TLA+ here is the combination of three features:
-
-- **Direct ownership modeling.** Sets, functions, and records describe which
-  request owns each slot, which operations may access it, and which blocks are
-  ready. These relationships can be specified without reproducing TPU Sync's
-  threads or callback structure. This matches TLA+'s emphasis on
-  [designs above the code level](https://lamport.azurewebsites.net/tla/high-level-view.html).
-- **Explicit progress assumptions.** TLA+ expresses both safety and eventual
-  progress, with fairness conditions stating which enabled actions cannot be
-  postponed forever. This separates “cancellation never frees a busy buffer”
-  from “a cancelled request eventually releases its buffers.” Reachability
-  checks show useful execution is possible; liveness reasoning asks whether it
-  is guaranteed under stated scheduling and transfer-completion assumptions.
-- **A path to refinement proofs.** TLA+ supports relating detailed protocols to
-  simpler contracts. Copying a row can leave the abstract block “unavailable”;
-  publication changes it to “ready.” Such abstractly unchanged steps are called
-  *stuttering*. This provides a foundation for proving that buffer-level steps
-  satisfy the abstract read contract. See the
+- **Express ownership and data identity directly.** TLA+'s sets, functions, and
+  records represent request-to-buffer mappings, reservations, and symbolic K/V
+  labels. This keeps the specification focused on transfer behavior without
+  reproducing the implementation's threads, callbacks, or tensor arithmetic.
+  See the [TLA+ overview](https://lamport.azurewebsites.net/tla/high-level-view.html).
+- **Separate safety from progress.** Safety requirements such as “a reserved
+  buffer cannot be reassigned” can be written as **invariants**: conditions that
+  hold in every reachable state. Temporal properties express **liveness**, such
+  as eventual release of a cancelled request's buffers. Explicit fairness and
+  transfer-completion assumptions make clear what progress depends on.
+- **A path to refinement proofs.** A refinement proof shows that every execution
+  of a detailed model corresponds to behavior allowed by a simpler specification.
+  TLA+ supports using the demo's simplified model as that specification, then
+  proving that a more detailed model of TPU Sync preserves its correctness
+  requirements. See the
   [refinement examples](https://lamport.azurewebsites.net/tla/auxiliary/auxiliary.html).
 
-TLC makes this specification executable for small configurations containing
-competing requests, multiple blocks, and reuse. It explores reachable states
-and helps debug proposed invariants before a broader proof effort. Its finite
-checks do not establish guarantees for arbitrary system sizes. Other tools also
-support these kinds of analysis; TLA+/TLC is a practical fit for combining an
-abstract contract, counterexample exploration, and later proof work.
+TLC explores reachable states to check safety and liveness, returning a
+counterexample if a property is violated. A completed check without violations
+establishes these properties for the chosen configuration. Separate reachability
+checks confirm that useful behaviors, such as successful reads and reuse, are
+possible.
 
-### Relate counterexamples to inference
+TLA+/TLC provides a practical combination of expressive specifications, executable
+checks, and support for relating models at different levels of detail. Other
+tools offer overlapping capabilities, with trade-offs in modeling effort,
+checking performance, and proof support worth considering as the project develops.
 
-A deterministic simulator executes selected events over actual K/V tensors in
-separate producer, staging, and destination arrays. Logical block tables recover
-token order from scattered storage. A small attention model computes next-token
-scores from the transferred cache and compares them with full recomputation
-from the same token history. Comparing every score can expose errors even when
-the selected token is unchanged.
+### Replay transfer counterexamples
 
-The intended replay workflow follows model-checker counterexamples through
-concrete copies to incorrect data and, when consumed, incorrect scores. A
-cancelled request need not decode to expose a violation: an outstanding copy
-accessing reused storage is already an error.
+Develop a simulator of the simplified transfer protocol that executes model
+actions in code. Use it to reproduce TLC counterexamples and connect violations
+in the formal model to their effects on data and buffer ownership:
 
-## Scope
+1. **Export the trace.** Save the TLC counterexample's initial configuration and
+   ordered actions, including the request, block, and buffer allocation involved.
+2. **Replay the actions.** Translate the trace into simulator operations using
+   the [action mapping](formal/action-mapping.md), preserving the recorded order.
+   When the trace comes from a deliberately faulty model variant, reproduce the
+   same fault in the simulator.
+3. **Verify the reproduction.** Compare data identity, readiness, block mappings,
+   and reservations with the model after each step to locate the violation or any
+   mismatch. Retain the scenario as a regression test for the corrected behavior.
 
-Verification targets the abstract protocol. Bounded checks establish properties
-only for the stated configurations; numerical tests and trace replay do not prove
-implementation refinement. The model simplifies TPU Sync's execution behavior.
-Hardware memory ordering, transport failures,
-retries, and crash recovery are outside this abstraction. No production
-correctness or performance claim follows from these checks.
+### Scope and limitations
 
-## Future directions
+The demo covers transfer coordination, cancellation, and buffer reuse in a
+simplified model. Hardware memory ordering, transport failures, retries, and
+crash recovery are outside its scope.
 
-Beyond the demo, the research can extend toward stronger guarantees and broader
-applicability:
+Model-checking results apply to the model and checked configurations. The
+integration plan below combines model checking with implementation tests; it
+does not formally verify TPU Sync's code. That would additionally require proving
+that TPU Sync's code conforms to the checked model. Refinement proofs between models
+alone do not establish this connection.
 
-1. **Establish progress guarantees.** Specify when a live request must eventually
-   become readable and when a cancelled request must eventually release its
-   resources. State the necessary assumptions, such as submitted copies eventually
-   finishing and eligible operations not being postponed forever. This addresses
-   whether the protocol can get stuck despite preserving safety.
+## From Demo to TPU Sync
 
-2. **Connect detailed protocols to the abstract contract.** Define how buffers,
-   copy stages, and callbacks correspond to the specification's state and steps.
-   Investigate a refinement proof: a proof that every allowed execution of the
-   detailed protocol satisfies the simpler contract. Begin with a detailed
-   protocol model; connecting actual implementation code requires additional
-   verification. A further question is whether guarantees can be proved for
-   arbitrary numbers of requests and blocks, beyond the checked finite cases.
+The demo's formal model, verification suite, and replay scenarios provide a
+starting point for checking models of TPU Sync transfer paths and testing their
+implementations. The integration plan has three steps:
 
-3. **Evaluate which results generalize.** Apply the contract to selected TPU Sync
-   transfer paths and another representative serving implementation. Identify
-   shared rules, implementation-specific assumptions, and any changes needed to
-   the abstraction. Evaluate the properties covered, faults detected, and cost
-   of modeling and checking each case. This tests whether the work offers a
-   reusable verification method beyond one example.
+1. **Adapt and check the model for TPU Sync.** Extend and revise the demo model
+   to represent TPU Sync's remote-loading path. Map its steps to code operations
+   and check safety, liveness, and reachability under documented assumptions.
+2. **Turn model scenarios into implementation tests.** Translate applicable model
+   scenarios into tests with controlled event ordering. Check data correctness,
+   cancellation, and reuse, and assess backend assumptions through integration tests.
+3. **Use verification to guide changes.** Update the model and rerun checks
+   alongside code tests for protocol changes. Include results in review, retain
+   regression tests in CI, and extend coverage to other paths.
 
-These extensions aim toward a research contribution suitable for a venue such
-as CAV or ICLR, supported by stronger proofs, reusable methods, or substantive
-findings across implementations.
-
-## Quick start
-
-### Bounded formal checks
-
-With Java 11 or newer and Python 3 available:
-
-```sh
-sh tooling/check_model.sh --download
-sh tooling/check_model.sh
-```
-
-The first command downloads the pinned TLC jar if needed; subsequent runs use
-the verified local copy. For offline use, pass `--jar /path/to/tla2tools.jar`.
-Logs, configurations, witness traces, and `summary.json` go to
-`.cache/tlc/latest/`, or the directory selected with `--output PATH`.
-`--timeout SECONDS` sets the per-check limit. Incomplete safety searches,
-unexpected violations, and checker errors cause the runner to fail.
-
-### Numerical demo and tests
-
-The demo runs on a laptop without accelerators or model downloads. The reference
-environment is Python 3.13.5 and NumPy 2.2.6. From the repository root, create an
-environment and run the demo and tests:
-
-```sh
-python3 -m venv .venv
-.venv/bin/python -m pip install -e .
-.venv/bin/python -m kv_transfer_demo.demo
-.venv/bin/python -m unittest discover -s tests -v
-```
-
-The demo compares decoding scores against full recomputation and reports the
-maximum error. To inspect cancellation, safe retirement, and slot reuse:
-
-```sh
-.venv/bin/python -m kv_transfer_demo.demo --cancel --trace
-```
-
-`--trace` prints the scheduled events and allocation generations. Invalid events
-raise an error instead of being silently skipped. The demos require no TPU Sync
-build or initialization.
+Refinement proofs can later establish that the detailed TPU Sync model preserves
+the demo specification's correctness requirements.
 
 ## Further reading
 
 - [Project plan](PLAN.md): detailed design, demonstrations, and completion criteria.
 - [TPU Sync mapping](docs/tpu-sync-mapping.md): production references and abstractions.
-- [Formal assumptions](formal/assumptions.md): execution assumptions and model bounds.
+- [Formal assumptions](formal/assumptions.md): execution assumptions and configuration limits.
 - [Action mapping](formal/action-mapping.md): correspondence between Python and TLA+.
 - [Formal results](formal/results.md): recorded checks and reproduction details.
