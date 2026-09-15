@@ -62,36 +62,88 @@ and reuse**:
 - Completion records report outcomes; reading them does not advance transfers
   or grant permission to access or release memory.
 
+## Demo goal
+
+Build a reproducible verification case study with two outcomes:
+
+1. **A checked transfer contract.** Specify competing requests whose KV caches
+   span multiple blocks, including out-of-order arrival, partial copies,
+   cancellation, and reuse. Check safety within explicit finite bounds and show
+   that successful reads and safe retirement are possible.
+2. **Replayable counterexamples.** Introduce controlled mistakes, such as early
+   publication or releasing staging on cancellation. Have TLC find failures and
+   replay them over actual K/V tensors, identifying the violated property, its
+   consequence, and the rule that prevents it. These are intentional demo faults,
+   not claims of bugs in TPU Sync.
+
+Together, these deliverables provide the basis for an ICLR blog post explaining
+the correctness problem and its verification. The [project plan](PLAN.md)
+details the design and completion criteria; [formal results](formal/results.md)
+record exact checks and bounds.
+
 ## Verification approach and rationale
 
-### Model event ordering and data identity
+### Represent the protocol as states and steps
 
-The correctness questions depend on the order of reads, writes, and buffer reuse.
-A TLA+ state machine makes those dependencies explicit through actions for copy
-progress, completion, publication, cancellation, and release. TLC explores all
-reachable states within a finite configuration, checking safety properties
-across the allowed event orderings.
+A **state** is a snapshot of the whole protocol: which requests are active or
+cancelled, which rows have been copied, which blocks are ready to read, and who
+owns or reserves each buffer. A **transition** is one permitted step that changes
+that snapshot. Each step has conditions for when it can happen and rules for
+what it changes. For example:
 
-The model tracks logical data identity, physical slots and their allocation
-generations, and outstanding operations. Symbolic labels replace numerical
-K/V rows because the properties concern data identity and completeness. Each copy
-propagates the label actually at its source, so overwritten staging produces
-incorrect destination data. This assumes that individual copies faithfully
-transfer their source contents.
+| Step | When it is allowed | What changes |
+| --- | --- | --- |
+| Copy a row to the destination | The destination copy has started and holds the required buffers | One destination row receives the staging row's contents |
+| Cancel a request | The request is active | Consumer access is withdrawn; submitted copies keep their reservations |
+| Record copy completion | Every required row has been copied | The copy's reservations are released |
+| Release a staging buffer | Its submitted copies have completed or been safely discarded | The buffer becomes available for reuse |
 
-The verification design uses small configurations with competing requests,
-KV caches spanning multiple blocks, partial copies, and buffer reuse to keep
-systematic exploration practical. Deliberately weakening a rule, such as
-allowing early publication, lets the checker produce an exact sequence showing
-why that rule matters.
+An execution is a sequence of these steps. After copying one row for request A,
+the next step might advance request B or cancel A. The model represents this
+concurrency by allowing any enabled step, rather than prescribing one schedule.
+A whole block copy spans several steps, so cancellation and other requests can
+occur between its rows.
 
-### Distinguish safety from progress
+Rows carry labels identifying their request, logical block, and position instead
+of full numerical tensors. A copy propagates the label actually at its source:
+if staging was overwritten with B's data, the destination receives B's label.
+This captures data-identity errors while keeping the state small, under the
+assumption that individual copies faithfully transfer their source contents.
 
-A protocol that prevents every read could satisfy read safety without serving
-any requests. Reachability checks therefore require successful reads and safe
-retirement to be possible. Proving that they eventually occur is a separate
-liveness question, requiring explicit assumptions about fair scheduling and
-physical transfer completion.
+### Why TLA+ and TLC
+
+**TLA+ specifies system behavior:** initial states, allowed steps, and required
+properties. **TLC checks finite instances of that specification.** A property
+that must hold in every reachable state is an **invariant**, such as keeping
+buffers reserved while copies can access them. If a property fails, TLC returns
+a **counterexample**: the sequence of steps leading to the failure.
+
+The reason to choose TLA+ here is the combination of three features:
+
+- **Direct ownership modeling.** Sets, functions, and records describe which
+  request owns each slot, which operations may access it, and which blocks are
+  ready. These relationships can be specified without reproducing TPU Sync's
+  threads or callback structure. This matches TLA+'s emphasis on
+  [designs above the code level](https://lamport.azurewebsites.net/tla/high-level-view.html).
+- **Explicit progress assumptions.** TLA+ expresses both safety and eventual
+  progress, with fairness conditions stating which enabled actions cannot be
+  postponed forever. This separates “cancellation never frees a busy buffer”
+  from “a cancelled request eventually releases its buffers.” Reachability
+  checks show useful execution is possible; liveness reasoning asks whether it
+  is guaranteed under stated scheduling and transfer-completion assumptions.
+- **A path to refinement proofs.** TLA+ supports relating detailed protocols to
+  simpler contracts. Copying a row can leave the abstract block “unavailable”;
+  publication changes it to “ready.” Such abstractly unchanged steps are called
+  *stuttering*. This provides a foundation for proving that buffer-level steps
+  satisfy the abstract read contract. See the
+  [refinement examples](https://lamport.azurewebsites.net/tla/auxiliary/auxiliary.html).
+
+TLC makes this specification executable for small configurations containing
+competing requests, multiple blocks, and reuse. It explores reachable states
+and helps debug proposed invariants before a broader proof effort. Its finite
+checks do not establish guarantees for arbitrary system sizes. Other tools also
+support these kinds of analysis; TLA+/TLC is a practical fit for combining an
+abstract contract, counterexample exploration, and later proof work.
 
 ### Relate counterexamples to inference
 
@@ -107,29 +159,44 @@ concrete copies to incorrect data and, when consumed, incorrect scores. A
 cancelled request need not decode to expose a violation: an outstanding copy
 accessing reused storage is already an error.
 
-## Scope and research direction
+## Scope
 
 Verification targets the abstract protocol. Bounded checks establish properties
 only for the stated configurations; numerical tests and trace replay do not prove
-implementation refinement. The model also separates events that TPU Sync handles
-consecutively within a callback, so not every modeled interleaving is established
-to occur in that implementation. Hardware memory ordering, transport failures,
+implementation refinement. The model simplifies TPU Sync's execution behavior.
+Hardware memory ordering, transport failures,
 retries, and crash recovery are outside this abstraction. No production
 correctness or performance claim follows from these checks.
 
-The core plan is to specify and check transfers of KV caches spanning multiple
-blocks, including out-of-order arrival, readiness of the entire cache,
-cancellation, and safe reuse. Numerical validation and counterexample replay
-connect the verified properties to executable behavior. Broader research
-directions include liveness verification, refinement proofs connecting
-implementations to the contract, and evaluation across representative serving systems.
+## Future directions
 
-The intended outcome is a reproducible case study for an ICLR blog post and a
-foundation for a broader formal-methods or ML-systems contribution. That research
-goal requires generalizable contracts or verification methods and evidence beyond
-a single small model. The [project plan](PLAN.md) defines the core artifact's
-design and completion criteria; [formal results](formal/results.md) record the
-exact checks and their bounds.
+Beyond the demo, the research can extend toward stronger guarantees and broader
+applicability:
+
+1. **Establish progress guarantees.** Specify when a live request must eventually
+   become readable and when a cancelled request must eventually release its
+   resources. State the necessary assumptions, such as submitted copies eventually
+   finishing and eligible operations not being postponed forever. This addresses
+   whether the protocol can get stuck despite preserving safety.
+
+2. **Connect detailed protocols to the abstract contract.** Define how buffers,
+   copy stages, and callbacks correspond to the specification's state and steps.
+   Investigate a refinement proof: a proof that every allowed execution of the
+   detailed protocol satisfies the simpler contract. Begin with a detailed
+   protocol model; connecting actual implementation code requires additional
+   verification. A further question is whether guarantees can be proved for
+   arbitrary numbers of requests and blocks, beyond the checked finite cases.
+
+3. **Evaluate which results generalize.** Apply the contract to selected TPU Sync
+   transfer paths and another representative serving implementation. Identify
+   shared rules, implementation-specific assumptions, and any changes needed to
+   the abstraction. Evaluate the properties covered, faults detected, and cost
+   of modeling and checking each case. This tests whether the work offers a
+   reusable verification method beyond one example.
+
+These extensions aim toward a research contribution suitable for a venue such
+as CAV or ICLR, supported by stronger proofs, reusable methods, or substantive
+findings across implementations.
 
 ## Quick start
 
